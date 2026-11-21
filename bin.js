@@ -2,7 +2,11 @@
 
 const { command, summary, flag, arg } = require('paparam')
 const path = require('path')
-const { apply, importOrg, seed, filter, resync, lint, preview, loadConfig, renameRepo, expandIncludes, listNpmTrust } = require('.')
+const { apply, importOrg, seed, filter, resync, lint, preview, loadConfig, peopleFor, renameRepo, expandIncludes, listNpmTrust } = require('.')
+
+function membersFile(cmd) {
+  return cmd.flags.members ? path.resolve(cmd.flags.members) : null
+}
 
 const applyCmd = command(
   'apply',
@@ -13,14 +17,16 @@ const applyCmd = command(
   flag('--no-renew', 'Do not recreate expired npm trusted publishers'),
   flag('--force-renew', 'Recreate every npm trusted publisher the registry has not confirmed, without waiting for the clock'),
   flag('--invalidate [names]', 'Comma-separated secret names to prompt for and set again'),
+  flag('--members [file]', 'Config file that lists the members of the org, for a file that mirrors teams to npm without listing them'),
   arg('<config>', 'Path to config JSON file or manifest with "includes"'),
   async function () {
     const root = path.resolve(applyCmd.args.config)
     const paths = expandIncludes(root)
     const isManifest = paths.length !== 1 || paths[0] !== root
+    const people = peopleFor(paths, membersFile(applyCmd))
     for (const configPath of paths) {
       if (isManifest) console.log('\n=== applying ' + path.relative(process.cwd(), configPath) + ' ===\n')
-      const config = loadConfig(configPath)
+      const config = loadConfig(configPath, { people })
       const statePath = configPath.replace(/\.json$/, '.state.json')
       await apply(config, {
         dry: applyCmd.flags.dryRun,
@@ -66,10 +72,11 @@ const importCmd = command(
 const seedCmd = command(
   'seed',
   summary('Write current config to state without checking GitHub'),
+  flag('--members [file]', 'Config file that lists the members of the org, for a file that mirrors teams to npm without listing them'),
   arg('<config>', 'Path to config JSON file'),
   function () {
     const configPath = path.resolve(seedCmd.args.config)
-    const config = loadConfig(configPath)
+    const config = loadConfig(configPath, { people: peopleFor([configPath], membersFile(seedCmd)) })
     const statePath = configPath.replace(/\.json$/, '.state.json')
     seed(config, { statePath })
   }
@@ -91,9 +98,10 @@ const resyncCmd = command(
 const lintCmd = command(
   'lint',
   summary('Check a config for mistakes without touching GitHub'),
+  flag('--members [file]', 'Config file that lists the members of the org, for a file that mirrors teams to npm without listing them'),
   arg('<config>', 'Path to config JSON file or manifest with "includes"'),
   function () {
-    const problems = lint(path.resolve(lintCmd.args.config))
+    const problems = lint(path.resolve(lintCmd.args.config), { members: membersFile(lintCmd) })
     for (const p of problems) console.error(path.relative(process.cwd(), p.file) + ': ' + p.level + ': ' + p.message)
     const errors = problems.filter((p) => p.level === 'error').length
     const warnings = problems.length - errors
@@ -185,8 +193,10 @@ const npmTrustCmd = command(
   function () {
     const root = path.resolve(npmTrustCmd.args.config)
     const hours = (ms) => Math.round(ms / 36e5) + 'h'
-    for (const configPath of expandIncludes(root)) {
-      const config = loadConfig(configPath)
+    const paths = expandIncludes(root)
+    const people = peopleFor(paths)
+    for (const configPath of paths) {
+      const config = loadConfig(configPath, { people })
       const statePath = configPath.replace(/\.json$/, '.state.json')
       for (const e of listNpmTrust(config, statePath)) {
         if (e.confirmed && npmTrustCmd.flags.unconfirmed) continue

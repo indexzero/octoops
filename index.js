@@ -11,7 +11,7 @@ const PERMISSIONS = {
   admin: 'admin'
 }
 
-module.exports = { apply, importOrg, seed, filter, resync, lint, preview, loadConfig, renameRepo, expandIncludes, listNpmTrust }
+module.exports = { apply, importOrg, seed, filter, resync, lint, preview, loadConfig, loadPeople, peopleFor, renameRepo, expandIncludes, listNpmTrust }
 
 const MERGE_QUEUE_METHODS = new Set(['MERGE', 'SQUASH', 'REBASE'])
 const MERGE_QUEUE_GROUPINGS = new Set(['ALLGREEN', 'HEADGREEN'])
@@ -425,7 +425,8 @@ function filter(config, opts = {}) {
 }
 
 function seed(config, opts = {}) {
-  config = deriveNpmOrgs(config)
+  config = deriveNpmOrgs(normalizeMembers(config, opts.people))
+  assertMirrorResolved(config)
   const state = loadState(opts.statePath)
   const presets = config.presets || {}
 
@@ -593,7 +594,7 @@ async function resync(config, opts = {}) {
 }
 
 async function apply(config, opts = {}) {
-  config = deriveNpmOrgs(config)
+  config = deriveNpmOrgs(normalizeMembers(config, opts.people))
   const dry = opts.dry === true
   if (config.enterprise) opts = { ...opts, enterprise: true }
   // values are prompted once per name per apply and reused across every target
@@ -1026,10 +1027,72 @@ function mirrorNpmTeams(repo) {
   return { ...repo, npm: Array.isArray(block) ? block.map(derive) : derive(block) }
 }
 
-function npmUserLookup(config) {
-  const users = new Map()
-  for (const login of Object.keys(config.npmUsers || {})) users.set(login.toLowerCase(), config.npmUsers[login])
-  return (login) => users.get(String(login).toLowerCase())
+const NPM_USERNAME = /^[a-z0-9][a-z0-9._-]*$/
+const MEMBER_KEYS = new Set(['github', 'npm'])
+
+// one person of the org. a string is someone whose npm username is their
+// GitHub login, the record is for when they differ, or when there is no npm
+// account at all. everywhere else a config names a person, it is by their
+// GitHub login
+function memberRecord(entry, where) {
+  // npm usernames are lower case, GitHub logins keep the case they were typed in
+  if (typeof entry === 'string' && entry) return { github: entry, npm: entry.toLowerCase() }
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.github !== 'string' || !entry.github) {
+    throw new Error(where + ' must list GitHub logins, or records like { "github": "login", "npm": "username" }')
+  }
+  for (const k of Object.keys(entry)) {
+    if (!MEMBER_KEYS.has(k)) throw new Error('unknown property "' + k + '" on member "' + entry.github + '" in ' + where + suggest(k, MEMBER_KEYS, null))
+  }
+  if (entry.npm !== undefined && (typeof entry.npm !== 'string' || !NPM_USERNAME.test(entry.npm))) {
+    throw new Error('npm of member "' + entry.github + '" in ' + where + ' must be an npm username (lowercase), leave it out for someone without one')
+  }
+  return { github: entry.github, npm: entry.npm === undefined ? null : entry.npm }
+}
+
+function addPerson(people, record, where) {
+  const key = record.github.toLowerCase()
+  if (people[key] !== undefined && people[key] !== record.npm) {
+    throw new Error('member "' + record.github + '" has two npm usernames, "' + people[key] + '" and "' + record.npm + '" (' + where + ')')
+  }
+  people[key] = record.npm
+}
+
+// folds member records down to what the rest of octoops has always worked
+// with, lists of GitHub logins, and keeps who is who on npm next to them as
+// "people": GitHub login in lower case to npm username, null for none.
+// given holds the people of other files, see loadPeople
+function normalizeMembers(config, given) {
+  // people is only ever made here, a config that has it has been through
+  if (config.people !== undefined) return config
+  if (config.admins === undefined && config.members === undefined && !given) return config
+
+  const people = { ...(given || {}) }
+  const out = { ...config }
+  for (const key of ['admins', 'members']) {
+    if (config[key] === undefined) continue
+    if (!Array.isArray(config[key])) throw new Error(key + ' must be a list')
+    const records = config[key].map((entry) => memberRecord(entry, key))
+    for (const r of records) addPerson(people, r, key)
+    out[key] = records.map((r) => r.github)
+  }
+  out.people = people
+  return out
+}
+
+// the people of several config files as one index. a file of teams names its
+// members by GitHub login, who they are on npm is on the org's member list,
+// which usually lives in another file
+function loadPeople(configPaths) {
+  let people = null
+  for (const configPath of configPaths) {
+    const raw = loadConfigInner(path.resolve(configPath), new Set())
+    for (const key of ['admins', 'members']) {
+      if (!Array.isArray(raw[key])) continue
+      people = people || {}
+      for (const entry of raw[key]) addPerson(people, memberRecord(entry, key + ' of ' + configPath), configPath)
+    }
+  }
+  return people
 }
 
 // the GitHub logins on a team and on every team below it. npm teams have no
@@ -1051,15 +1114,18 @@ function teamLogins(team, teams) {
 const derivedNpmOrgs = new WeakSet()
 
 // turns "mirror" into the teams and seats it stands for, so that apply, lint
-// and seed only ever see npm teams spelled out. a login without an npm
-// username is left off: guessing that the same name is the same person
-// would hand a stranger the package
+// and seed only ever see npm teams spelled out. a member without an npm
+// username is left off. so is a login that is not a member at all, which
+// validateNpmMirror reports. without the member list there is nothing to
+// turn it into, and the config is left as it is for assertMirrorResolved
 function deriveNpmOrgs(config) {
   const npmOrgs = config.npmOrgs
   if (derivedNpmOrgs.has(config) || !npmOrgs || typeof npmOrgs !== 'object' || Array.isArray(npmOrgs)) return config
   if (!Object.values(npmOrgs).some((e) => e && typeof e === 'object' && e.mirror !== undefined)) return config
+  if (!config.people) return config
+  if (Object.values(npmOrgs).some((e) => e && typeof e === 'object' && e.seats !== undefined && e.mirror !== undefined)) return config
 
-  const lookup = npmUserLookup(config)
+  const lookup = (login) => config.people[String(login).toLowerCase()]
   const ghTeams = Array.isArray(config.teams) ? config.teams : []
   const byName = new Map(ghTeams.map((t) => [npmTeamName(t.name), t]))
   const out = {}
@@ -1134,7 +1200,9 @@ const ROOT_KEYS = new Set([
   'presets', 'defaults',
   'repos', 'teams', 'admins', 'members',
   'security', 'runnerGroups', 'hostedRunners', 'pruneOfflineRunners',
-  'apps', 'orgSecrets', 'npmOrgs', 'npmUsers'
+  'apps', 'orgSecrets', 'npmOrgs',
+  // made by normalizeMembers, never written
+  'people'
 ])
 
 // seats is derived from mirror on load, never written
@@ -1302,43 +1370,43 @@ function validateNpmOrgs(npmOrgs, warn = warnStderr) {
   }
 }
 
-function validateNpmMirror(config, warn = warnStderr, fail = warn) {
-  if (config.npmUsers !== undefined) {
-    const users = config.npmUsers
-    if (!users || typeof users !== 'object' || Array.isArray(users)) throw new Error('npmUsers must be an object like { "github-login": "npm-username" }')
-    const owners = new Map()
-    for (const login of Object.keys(users)) {
-      const name = users[login]
-      // false says it out loud: this login has no npm account and gets nothing
-      if (name === false) continue
-      if (typeof name !== 'string' || !/^[a-z0-9][a-z0-9._-]*$/.test(name)) throw new Error('npmUsers "' + login + '" must map to an npm username (lowercase), or to false for someone who gets no npm access')
-      if (owners.has(name)) warn('npmUsers maps both "' + owners.get(name) + '" and "' + login + '" to npm user "' + name + '"')
-      else owners.set(name, login)
-    }
+// a mirrored team is only as good as the member list behind it. applying one
+// without the list would take everybody off the npm team
+function assertMirrorResolved(config) {
+  const npmOrgs = config.npmOrgs
+  if (!npmOrgs || typeof npmOrgs !== 'object' || config.people) return
+  for (const org of Object.keys(npmOrgs)) {
+    if (!npmOrgs[org] || npmOrgs[org].mirror === undefined) continue
+    throw new Error('npmOrgs "' + org + '" mirrors teams, and this file does not list the members of the org. Apply it through a manifest that includes the file that does, or name that file with --members')
   }
+}
 
+function validateNpmMirror(config, warn = warnStderr, fail = warn) {
+  assertMirrorResolved(config)
   const npmOrgs = config.npmOrgs
   if (!npmOrgs || typeof npmOrgs !== 'object') return
-  const lookup = npmUserLookup(config)
+  const people = config.people || {}
   const ghTeams = Array.isArray(config.teams) ? config.teams : []
   const byName = new Map(ghTeams.map((t) => [npmTeamName(t.name), t]))
 
   for (const org of Object.keys(npmOrgs)) {
     const entry = npmOrgs[org]
     if (!entry || !Array.isArray(entry.mirror)) continue
+    // someone on a mirrored team who is no member of the org is a typo or a
+    // leaver. a member without an npm username is neither, they have none.
     // one line per person, however many mirrored teams they are on
-    const unmapped = new Map()
+    const unknown = new Map()
     for (const name of entry.mirror) {
       const team = byName.get(npmTeamName(name))
       if (!team) continue
       for (const login of teamLogins(team, ghTeams)) {
-        if (lookup(login) !== undefined) continue
-        if (!unmapped.has(login)) unmapped.set(login, [])
-        unmapped.get(login).push(name)
+        if (people[String(login).toLowerCase()] !== undefined) continue
+        if (!unknown.has(login)) unknown.set(login, [])
+        unknown.get(login).push(name)
       }
     }
-    for (const [login, teams] of unmapped) {
-      fail('no npmUsers entry for "' + login + '" (team "' + teams.join('", "') + '"), they get no access to npm org "' + org + '"')
+    for (const [login, teams] of unknown) {
+      fail('"' + login + '" (team "' + teams.join('", "') + '") is not in the members of the org, they get no access to npm org "' + org + '"')
     }
   }
 }
@@ -1391,13 +1459,20 @@ function validateMerging(merging, where, warn = warnStderr) {
 
 // everything that can be said about a config without asking GitHub. takes a
 // config or a manifest, a manifest also gets the checks that span its files
-function lint(configPath) {
+function lint(configPath, opts = {}) {
   const problems = []
   const loaded = []
+  const files = expandIncludes(configPath)
+  let people = null
+  try {
+    people = peopleFor(files, opts.members)
+  } catch (err) {
+    problems.push({ file: path.resolve(configPath), level: 'error', message: err.message })
+  }
 
-  for (const file of expandIncludes(configPath)) {
+  for (const file of files) {
     try {
-      const config = loadConfig(file)
+      const config = loadConfig(file, { people })
       validateConfig(config, (message) => problems.push({ file, level: 'warning', message }), (message) => problems.push({ file, level: 'error', message }))
       // unknown defaults and old-style preset names only surface on resolve
       for (const raw of config.repos || []) {
@@ -1520,14 +1595,24 @@ function lintNpmOrgs(loaded, problems) {
 // the repo entries exactly as apply sees them, with extends, defaults and
 // presets all folded in. name is "repo" or "org/repo", without one every
 // repo is returned. takes a config or a manifest
-function preview(configPath, name) {
+// the member lists a set of files can see: their own when they are applied
+// together as a manifest, and that of a file named with --members
+function peopleFor(files, members) {
+  const from = members ? [members] : []
+  if (files.length > 1) from.push(...files)
+  return from.length ? loadPeople(from) : null
+}
+
+function preview(configPath, name, opts = {}) {
   const slash = name ? name.indexOf('/') : -1
   const org = slash === -1 ? null : name.slice(0, slash)
   const repoName = name ? name.slice(slash + 1) : null
   const out = []
 
-  for (const file of expandIncludes(configPath)) {
-    const config = loadConfig(file)
+  const files = expandIncludes(configPath)
+  const people = peopleFor(files, opts.members)
+  for (const file of files) {
+    const config = loadConfig(file, { people })
     if (org && (config.org || '').toLowerCase() !== org.toLowerCase()) continue
     for (const raw of config.repos || []) {
       if (repoName && (raw.name || '').toLowerCase() !== repoName.toLowerCase()) continue
@@ -1591,8 +1676,11 @@ function editDistance(a, b) {
   return prev[n]
 }
 
-function loadConfig(configPath) {
-  return deriveNpmOrgs(expandPresets(loadConfigInner(path.resolve(configPath), new Set())))
+// opts.people is the people of other files, from loadPeople
+function loadConfig(configPath, opts = {}) {
+  const raw = loadConfigInner(path.resolve(configPath), new Set())
+  if (raw.people !== undefined) throw new Error('people is derived from admins and members, do not write it')
+  return deriveNpmOrgs(normalizeMembers(expandPresets(raw), opts.people))
 }
 
 function expandIncludes(configPath) {
@@ -1604,7 +1692,7 @@ function expandIncludesInner(configPath, seen) {
   const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
   if (!raw.includes) return [configPath]
 
-  const FORBIDDEN = ['org', 'repos', 'teams', 'admins', 'members', 'security', 'runnerGroups', 'hostedRunners', 'pruneOfflineRunners', 'enterprise', 'extends', 'presets', 'defaults', 'npmOrgs', 'npmUsers']
+  const FORBIDDEN = ['org', 'repos', 'teams', 'admins', 'members', 'security', 'runnerGroups', 'hostedRunners', 'pruneOfflineRunners', 'enterprise', 'extends', 'presets', 'defaults', 'npmOrgs']
   for (const k of FORBIDDEN) {
     if (k in raw) throw new Error('manifest ' + configPath + ' has both "includes" and "' + k + '" — manifests are orchestration-only')
   }

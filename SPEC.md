@@ -127,13 +127,18 @@ Two directives are rewritten into the explicit shape above when a config is load
 lint, seed and preview only see npm teams and grants spelled out.
 
 - `npmOrgs.<org>.mirror` lists GitHub teams of the same file. Each becomes an npm team named
-  after it, holding its members and those of every team below it, translated through
-  `npmUsers`
+  after it, holding its members and those of every team below it, each under their npm
+  username
 - `npm.mirrorTeams: true` grants `read-only` to the npm team of every team in the repo's
   `teams`, whatever its GitHub permission. `read-write` is never derived
-- `npmUsers` maps GitHub logins (matched without case) to npm usernames. A login without an
-  entry is left off the team: a warning on apply, an error to lint. `false` marks a login
-  that is meant to have no npm access
+- An entry of `admins` or `members` is a GitHub login, or a record `{ github, npm }`. A string
+  is someone with the same name on both. A record without `npm` is someone with no npm
+  account, who is left off the npm team
+- A file that mirrors teams without listing members takes the list from the other files of a
+  manifest, or from the file named with `--members`. With neither, apply, seed and lint refuse
+  it
+- Someone on a mirrored team who is in no member list is left off: a warning on apply, an
+  error to lint
 - A private repo publishing a package with no `access` is an error to lint
 - Every mirrored member is seated in the npm org as `developer`, unless `npm org ls` already
   lists them. Seats are never removed

@@ -45,7 +45,7 @@ octoops lint config.json
 octoops lint org-manifest.json
 ```
 
-It runs every check `apply` does before its first API call (unknown properties, unknown presets and defaults, malformed secrets, team members missing from `admins`/`members`, an app declared in two places, malformed `npmOrgs` and npm package access) and exits non-zero on an error. Given a manifest it lints each included file and also catches an app that sits in the root `apps` list of one file and on a repo entry in another, an npm team or npm roster declared in two files, a package granted to an npm team no file declares or mirrors, and a mirrored team whose child sits in another file. Two more are errors to lint, though an apply goes ahead: a member of a mirrored team with no `npmUsers` entry, and a private repo that publishes a public package.
+It runs every check `apply` does before its first API call (unknown properties, unknown presets and defaults, malformed secrets, team members missing from `admins`/`members`, an app declared in two places, malformed `npmOrgs` and npm package access) and exits non-zero on an error. Given a manifest it lints each included file and also catches an app that sits in the root `apps` list of one file and on a repo entry in another, an npm team or npm roster declared in two files, a package granted to an npm team no file declares or mirrors, and a mirrored team whose child sits in another file. Two more are errors to lint, though an apply goes ahead: someone on a mirrored team who is not a member of the org, and a private repo that publishes a public package.
 
 Print a repo entry the way `apply` sees it, with `extends`, `defaults` and presets all resolved:
 
@@ -772,6 +772,19 @@ GitHub flags this API as beta — the parameter shape may change on their side.
 
 Removing someone from the org also removes them from all teams. If that person is still listed in a team config, the next apply will re-add them. Make sure `admins`/`members` is the superset of everyone referenced in `teams`.
 
+A member can be a record, which also says who they are on npm:
+
+```json
+"members": [
+  "charlie",
+  { "github": "dave", "npm": "dave-on-npm" },
+  { "github": "eve" }
+]
+```
+
+`charlie` has the same username on GitHub and npm. `dave` has a different one. `eve` has no npm account. Everywhere else a config names a person (a team, a collaborator, a reviewer) it is by their GitHub login. GitHub is sent the same list of logins either way; the `npm` name is only used when [teams are mirrored to npm](#mirroring-github-teams). `admins` takes records as well.
+
+
 ### Manage org teams
 
 ```json
@@ -1067,7 +1080,7 @@ Name the teams to mirror, in the file that declares them:
 ```json
 {
   "org": "my-org",
-  "npmUsers": { "Alice": "alice", "bob": "bob-on-npm" },
+  "members": [{ "github": "Alice", "npm": "alice" }, { "github": "bob", "npm": "bob-on-npm" }],
   "teams": [
     { "name": "sdk", "members": [{ "username": "bob", "role": "member" }] },
     { "name": "sdk-write", "parent": "sdk", "members": [{ "username": "Alice", "role": "member" }] }
@@ -1094,13 +1107,14 @@ and ask for the repo's teams on the package:
 
 That is the same as writing npm teams `sdk` (bob-on-npm, alice) and `sdk-write` (alice), and granting both `read-only` on `@my-scope/foo`. `octoops preview` shows the grants. `teams` on the package still works next to `mirrorTeams`, and wins for a team named in both.
 
-`npmUsers` maps GitHub logins to npm usernames. Put it in one file and `extends` it from the others.
+Who a person is on npm comes from the org's [member list](#manage-org-members). A file that mirrors teams and does not hold that list needs to be shown it: apply both through one manifest, or name the file that has it with `--members members.json`. Without the list the file is refused, since it would otherwise be read as a team with nobody on it.
 
 Rules:
 
 - A mirrored team, its parents and its children are declared in one file.
 - Every team a repo grants is mirrored into its package's scope.
-- A login with no `npmUsers` entry gets no access, and is an error to `octoops lint`. Map it to `false` for someone who is meant to have none.
+- A member with no `npm` username gets no access.
+- Someone on a mirrored team who is not a member of the org gets none either, and is an error to `octoops lint`.
 - A mirrored member gets a `developer` seat in the npm org. Leaving the team takes them off the npm team, the seat stays.
 - npm's built-in `developers` team holds every org member and reads no private package.
 
