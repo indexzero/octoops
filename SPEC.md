@@ -134,6 +134,8 @@ lint, seed and preview only see npm teams and grants spelled out.
 - An entry of `admins` or `members` is a GitHub login, or a record `{ github, npm }`. A string
   is someone with the same name on both. A record without `npm` is someone with no npm
   account, who is left off the npm team
+- A record may carry `role`, `admin` or `member`. An admin record in `members` is the same as
+  that login in `admins`. Both forms produce the same two lists of logins, in config and state
 - A file that mirrors teams without listing members takes the list from the other files of a
   manifest, or from the file named with `--members`. With neither, apply, seed and lint refuse
   it

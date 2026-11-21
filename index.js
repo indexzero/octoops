@@ -1028,7 +1028,8 @@ function mirrorNpmTeams(repo) {
 }
 
 const NPM_USERNAME = /^[a-z0-9][a-z0-9._-]*$/
-const MEMBER_KEYS = new Set(['github', 'npm'])
+const MEMBER_KEYS = new Set(['github', 'npm', 'role'])
+const MEMBER_ROLES = new Set(['admin', 'member'])
 
 // one person of the org. a string is someone whose npm username is their
 // GitHub login, the record is for when they differ, or when there is no npm
@@ -1046,13 +1047,17 @@ function memberRecord(entry, where) {
   if (entry.npm !== undefined && (typeof entry.npm !== 'string' || !NPM_USERNAME.test(entry.npm))) {
     throw new Error('npm of member "' + entry.github + '" in ' + where + ' must be an npm username (lowercase), leave it out for someone without one')
   }
-  return { github: entry.github, npm: entry.npm === undefined ? null : entry.npm }
+  if (entry.role !== undefined && !MEMBER_ROLES.has(entry.role)) {
+    throw new Error('role of member "' + entry.github + '" in ' + where + ' must be "admin" or "member"')
+  }
+  return { github: entry.github, npm: entry.npm === undefined ? null : entry.npm, role: entry.role }
 }
 
 function addPerson(people, record, where) {
   const key = record.github.toLowerCase()
   if (people[key] !== undefined && people[key] !== record.npm) {
-    throw new Error('member "' + record.github + '" has two npm usernames, "' + people[key] + '" and "' + record.npm + '" (' + where + ')')
+    const names = [people[key], record.npm].map((n) => (n === null ? 'none' : '"' + n + '"'))
+    throw new Error('member "' + record.github + '" has two npm usernames, ' + names.join(' and ') + ' (' + where + ')')
   }
   people[key] = record.npm
 }
@@ -1068,13 +1073,36 @@ function normalizeMembers(config, given) {
 
   const people = { ...(given || {}) }
   const out = { ...config }
+  // a record can say its own role, so one list can hold everybody. the two
+  // lists of logins are still what the rest of octoops reads, and what state
+  // holds, so a config moved from "admins" to records reads the same state.
+  // a list that names no admin leaves the admins unmanaged, as before
+  const lists = { admins: [], members: [] }
+  const said = new Map()
   for (const key of ['admins', 'members']) {
     if (config[key] === undefined) continue
     if (!Array.isArray(config[key])) throw new Error(key + ' must be a list')
-    const records = config[key].map((entry) => memberRecord(entry, key))
-    for (const r of records) addPerson(people, r, key)
-    out[key] = records.map((r) => r.github)
+    const implied = key === 'admins' ? 'admin' : 'member'
+    for (const entry of config[key]) {
+      const r = memberRecord(entry, key)
+      addPerson(people, r, key)
+      const role = r.role || implied
+      const id = r.github.toLowerCase()
+      // someone in both plain lists is as old as the two lists. a record
+      // that says a role is a statement, and two of those cannot disagree
+      const before = said.get(id)
+      if (before && before.role !== role && (before.explicit || r.role !== undefined)) {
+        throw new Error('"' + r.github + '" is an admin in one place and a member in another')
+      }
+      if (r.role !== undefined && key === 'admins' && r.role !== 'admin') {
+        throw new Error('"' + r.github + '" is an admin in one place and a member in another')
+      }
+      said.set(id, { role, explicit: r.role !== undefined || (before && before.explicit) })
+      lists[role === 'admin' ? 'admins' : 'members'].push(r.github)
+    }
   }
+  if (config.members !== undefined) out.members = lists.members
+  if (config.admins !== undefined || lists.admins.length) out.admins = lists.admins
   out.people = people
   return out
 }
